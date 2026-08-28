@@ -176,6 +176,12 @@ func (opts *ToolboxOptions) GetCustomConfigFiles(ctx context.Context) ([]string,
 
 // LoadConfig checks and merge files that should be loaded into the server
 func (opts *ToolboxOptions) LoadConfig(ctx context.Context, parser *ConfigParser) (bool, error) {
+	// Under lazy loading, defer source env resolution + decoding so a missing
+	// source env var (or unreachable datastore) never fails startup.
+	if opts.Cfg.LazyLoading {
+		parser.LazySources = true
+	}
+
 	// get all the file paths for custom config file
 	filesPaths, isCustomConfigured, err := opts.GetCustomConfigFiles(ctx)
 	if err != nil {
@@ -301,6 +307,7 @@ func (opts *ToolboxOptions) LoadConfig(ctx context.Context, parser *ConfigParser
 	opts.Cfg.ToolConfigs = finalConfig.Tools
 	opts.Cfg.PromptConfigs = finalConfig.Prompts
 	opts.Cfg.GroupConfigs = finalConfig.Groups
+	opts.Cfg.RawSourceBlocks = finalConfig.RawSourceBlocks
 
 	return isCustomConfigured, nil
 }

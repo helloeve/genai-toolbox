@@ -22,11 +22,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/parser"
 	"github.com/google/go-cmp/cmp"
 	"github.com/googleapis/mcp-toolbox/internal/auth/generic"
 	"github.com/googleapis/mcp-toolbox/internal/server"
@@ -40,6 +40,12 @@ type Config struct {
 	Tools           server.ToolConfigs           `yaml:"tools"`
 	Prompts         server.PromptConfigs         `yaml:"prompts"`
 	Groups          server.GroupConfigs          `yaml:"groups"`
+
+	// RawSourceBlocks holds each source's env-unresolved, flat-format YAML block
+	// keyed by source name. It is populated only when the parser runs with
+	// LazySources enabled; in that mode Sources is left empty and sources are
+	// materialized from these blocks on first use.
+	RawSourceBlocks map[string][]byte `yaml:"-"`
 }
 
 type ConfigParser struct {
@@ -54,59 +60,52 @@ type ConfigParser struct {
 	// "") so required string fields still pass validation. The served path leaves
 	// this false so missing config still fails fast.
 	AllowMissingEnvVars bool
+
+	// LazySources, when true, defers source config env resolution and decoding:
+	// each source's flat-format YAML block is retained (env-unresolved) in
+	// Config.RawSourceBlocks instead of being decoded into Config.Sources. Used
+	// by --lazy-loading so a missing source env var never fails startup.
+	LazySources bool
 }
 
 // parseEnv replaces environment variables ${ENV_NAME} with their values.
 // also support ${ENV_NAME:default_value}.
 func (p *ConfigParser) parseEnv(input string) (string, error) {
-	re := regexp.MustCompile(`\$\{(\w+)(:([^}]*))?\}`)
-
 	if p.EnvVars == nil {
 		p.EnvVars = make(map[string]string)
 	}
 
 	var missing []string
 	seenMissing := make(map[string]bool)
-	matches := re.FindAllStringSubmatchIndex(input, -1)
-	var output strings.Builder
-	lastIndex := 0
-	for _, match := range matches {
-		start, end := match[0], match[1]
-		output.WriteString(input[lastIndex:start])
-
-		variableName := input[match[2]:match[3]]
-		defaultValue := ""
-		defaultProvided := match[4] != -1 && match[5] != -1
-		if defaultProvided {
-			defaultValue = input[match[6]:match[7]]
-		}
-
-		if defaultProvided {
-			p.OptionalEnvVars = append(p.OptionalEnvVars, variableName)
+	// The ${VAR}/${VAR:default} scanning lives in util.ExpandEnvVars; this
+	// closure supplies the config-parse policy (env tracking, AllowMissingEnvVars
+	// placeholder, and line/column error reporting).
+	output := util.ExpandEnvVars(input, func(r util.EnvRef) string {
+		if r.DefaultDefined {
+			p.OptionalEnvVars = append(p.OptionalEnvVars, r.Name)
 		} else {
-			p.requiredEnvVars = append(p.requiredEnvVars, variableName)
+			p.requiredEnvVars = append(p.requiredEnvVars, r.Name)
 		}
 
-		if value, found := os.LookupEnv(variableName); found {
-			p.EnvVars[variableName] = value
-			output.WriteString(value)
-		} else if defaultProvided {
-			p.EnvVars[variableName] = defaultValue
-			output.WriteString(defaultValue)
-		} else {
-			if p.AllowMissingEnvVars {
-				p.EnvVars[variableName] = variableName
-				output.WriteString(variableName)
-			} else if !seenMissing[variableName] {
-				seenMissing[variableName] = true
-				line, column := lineColumnAt(input, start)
-				missing = append(missing, fmt.Sprintf("%q (line %d, column %d)", variableName, line, column))
-			}
+		if value, found := os.LookupEnv(r.Name); found {
+			p.EnvVars[r.Name] = value
+			return value
 		}
-
-		lastIndex = end
-	}
-	output.WriteString(input[lastIndex:])
+		if r.DefaultDefined {
+			p.EnvVars[r.Name] = r.DefaultValue
+			return r.DefaultValue
+		}
+		if p.AllowMissingEnvVars {
+			p.EnvVars[r.Name] = r.Name
+			return r.Name
+		}
+		if !seenMissing[r.Name] {
+			seenMissing[r.Name] = true
+			line, column := lineColumnAt(input, r.Start)
+			missing = append(missing, fmt.Sprintf("%q (line %d, column %d)", r.Name, line, column))
+		}
+		return ""
+	})
 
 	// Filter out OptionalEnvVars that were also found as required
 	var finalOptional []string
@@ -126,7 +125,7 @@ func (p *ConfigParser) parseEnv(input string) (string, error) {
 		}
 	}
 
-	return output.String(), err
+	return output, err
 }
 
 // ParseConfig parses the provided yaml into appropriate configs.
@@ -148,6 +147,10 @@ func lineColumnAt(input string, index int) (int, int) {
 }
 
 func (p *ConfigParser) ParseConfig(ctx context.Context, raw []byte) (Config, error) {
+	if p.LazySources {
+		return p.parseConfigLazy(ctx, raw)
+	}
+
 	var config Config
 	// Replace environment variables if found
 	output, err := p.parseEnv(string(raw))
@@ -167,6 +170,87 @@ func (p *ConfigParser) ParseConfig(ctx context.Context, raw []byte) (Config, err
 		return config, err
 	}
 	return config, nil
+}
+
+// parseConfigLazy parses a config while deferring source env resolution and
+// decoding. Sources are converted to flat format but not env-resolved; their raw
+// blocks are retained in Config.RawSourceBlocks for materialization on first use.
+// Everything else (tools, authServices, embeddingModels, prompts, groups) is
+// env-resolved and decoded eagerly, exactly as in the non-lazy path.
+func (p *ConfigParser) parseConfigLazy(ctx context.Context, raw []byte) (Config, error) {
+	var config Config
+
+	// Convert to flat format first, without resolving env vars, so that source
+	// blocks keep their unresolved ${VAR} references.
+	flat, err := ConvertConfig(ctx, raw)
+	if err != nil {
+		return config, fmt.Errorf("error converting config file: %s", err)
+	}
+
+	sourceBlocks, otherDocs, err := splitSourceBlocks(flat)
+	if err != nil {
+		return config, err
+	}
+
+	// Resolve env + decode everything except sources.
+	resolved, err := p.parseEnv(string(otherDocs))
+	if err != nil {
+		return config, fmt.Errorf("error parsing environment variables: %s", err)
+	}
+
+	config.Sources, config.AuthServices, config.EmbeddingModels, config.Tools, config.Prompts, config.Groups, err = server.UnmarshalPrimitiveConfig(ctx, []byte(resolved))
+	if err != nil {
+		return config, err
+	}
+	config.RawSourceBlocks = sourceBlocks
+	return config, nil
+}
+
+// splitSourceBlocks partitions a flat-format (multi-document) config into the
+// per-source raw YAML blocks (keyed by source name, env-unresolved) and the
+// remaining documents concatenated back together. It performs no env
+// substitution, so a source block referencing an unset variable does not fail.
+func splitSourceBlocks(flatRaw []byte) (map[string][]byte, []byte, error) {
+	file, err := parser.ParseBytes(flatRaw, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to parse config: %s", yaml.FormatError(err, false, false))
+	}
+
+	sourceBlocks := make(map[string][]byte)
+	var otherDocs bytes.Buffer
+	// keepDoc appends a single normalized document (exactly one "---" marker) to
+	// otherDocs. DocumentNode.String() already includes a leading "---", so we
+	// strip it first to avoid emitting empty documents from doubled separators.
+	keepDoc := func(docStr string) {
+		body := strings.TrimPrefix(strings.TrimSpace(docStr), "---")
+		body = strings.TrimSpace(body)
+		otherDocs.WriteString("---\n")
+		otherDocs.WriteString(body)
+		otherDocs.WriteString("\n")
+	}
+	for _, doc := range file.Docs {
+		if doc == nil || doc.Body == nil {
+			continue
+		}
+		docStr := doc.String()
+
+		var resource map[string]any
+		// Classifying only needs 'kind' and 'name', which are literals; decoding
+		// tolerates unresolved ${VAR} values (they stay strings).
+		if derr := yaml.NewDecoder(strings.NewReader(docStr)).Decode(&resource); derr != nil {
+			// Could not classify; leave it in the eager path.
+			keepDoc(docStr)
+			continue
+		}
+		kind, _ := resource["kind"].(string)
+		name, _ := resource["name"].(string)
+		if kind == "source" && name != "" {
+			sourceBlocks[name] = []byte(docStr)
+			continue
+		}
+		keepDoc(docStr)
+	}
+	return sourceBlocks, otherDocs.Bytes(), nil
 }
 
 // ConvertConfig converts configuration file to flat format and rewrites toolsets
@@ -439,6 +523,22 @@ func mergeConfigs(files ...Config) (Config, error) {
 				conflicts = append(conflicts, fmt.Sprintf("group '%s' (file #%d)", name, fileIndex+1))
 			} else {
 				merged.Groups[name] = grp
+			}
+		}
+
+		// Check for conflicts and merge deferred (lazy) source blocks. These
+		// share the source namespace, so a name colliding with an eager source
+		// or another lazy block is a conflict.
+		for name, block := range file.RawSourceBlocks {
+			_, inEager := merged.Sources[name]
+			_, inLazy := merged.RawSourceBlocks[name]
+			if inEager || inLazy {
+				conflicts = append(conflicts, fmt.Sprintf("source '%s' (file #%d)", name, fileIndex+1))
+			} else {
+				if merged.RawSourceBlocks == nil {
+					merged.RawSourceBlocks = make(map[string][]byte)
+				}
+				merged.RawSourceBlocks[name] = block
 			}
 		}
 	}

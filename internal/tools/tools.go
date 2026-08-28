@@ -137,6 +137,11 @@ type Tool interface {
 	ToConfig() ToolConfig
 	GetAuthTokenHeaderName(sources.Source) (string, error)
 	GetParameters(sources.Source) (parameters.Parameters, error)
+	// GetStaticParameters returns the tool's source-independent parameter
+	// skeleton. Unlike GetParameters, it never inspects a source, so it is safe
+	// to call when the source is unavailable (e.g. a lazily loaded source that
+	// has not been materialized yet) to render a tools/list manifest.
+	GetStaticParameters() parameters.Parameters
 	GetScopesRequired() []string
 	ValidateSource(sources.Source) error
 }
@@ -241,6 +246,10 @@ func (b BaseTool[T]) StaticManifest() Manifest {
 
 func (b BaseTool[T]) GetParameters(_ sources.Source) (parameters.Parameters, error) {
 	return b.StaticParameters, nil
+}
+
+func (b BaseTool[T]) GetStaticParameters() parameters.Parameters {
+	return b.StaticParameters
 }
 
 func (b BaseTool[T]) Authorized(verifiedAuthServices []string) bool {

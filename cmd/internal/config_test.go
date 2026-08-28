@@ -2739,3 +2739,79 @@ statement: SELECT 1
 		})
 	}
 }
+
+func TestParseConfigLazy(t *testing.T) {
+	ctx, err := testutils.ContextWithNewLogger()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	// A source referencing unset env vars must NOT fail parsing under lazy mode.
+	cfg := `
+sources:
+  my-pg:
+    kind: postgres
+    host: ${DB_HOST}
+    port: ${DB_PORT:5432}
+    database: ${DB_NAME}
+    user: ${DB_USER}
+    password: ${DB_PASS}
+tools:
+  example_tool:
+    kind: postgres-sql
+    source: my-pg
+    description: some description
+    statement: SELECT 1;
+`
+	parser := &ConfigParser{LazySources: true}
+	got, err := parser.ParseConfig(ctx, []byte(cfg))
+	if err != nil {
+		t.Fatalf("lazy ParseConfig should not fail on missing source env vars, got: %v", err)
+	}
+
+	// Sources are deferred: not decoded, retained raw instead.
+	if len(got.Sources) != 0 {
+		t.Errorf("expected no decoded sources under lazy mode, got %d", len(got.Sources))
+	}
+	block, ok := got.RawSourceBlocks["my-pg"]
+	if !ok {
+		t.Fatalf("expected raw source block for %q, got keys: %v", "my-pg", keysOf(got.RawSourceBlocks))
+	}
+	if !strings.Contains(string(block), "${DB_HOST}") {
+		t.Errorf("raw source block should retain unresolved env refs, got:\n%s", block)
+	}
+	// Tools are still decoded eagerly.
+	if _, ok := got.Tools["example_tool"]; !ok {
+		t.Errorf("expected tool %q to be decoded, got: %v", "example_tool", got.Tools)
+	}
+}
+
+func TestParseConfigLazyToolEnvStillFails(t *testing.T) {
+	ctx, err := testutils.ContextWithNewLogger()
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	// Only sources are deferred; a missing env var in a non-source (tool) block
+	// must still fail fast.
+	cfg := `
+tools:
+  example_tool:
+    kind: postgres-sql
+    source: my-pg
+    description: ${TOOL_DESC}
+    statement: SELECT 1;
+`
+	parser := &ConfigParser{LazySources: true}
+	if _, err := parser.ParseConfig(ctx, []byte(cfg)); err == nil {
+		t.Fatal("expected lazy ParseConfig to fail on missing tool env var, got nil")
+	}
+}
+
+func keysOf(m map[string][]byte) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}

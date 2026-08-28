@@ -125,9 +125,17 @@ func (g Group) ToolsetManifest(serverVersion string, mgr GroupManager) (tools.To
 				return tools.ToolsetManifest{}, fmt.Errorf("unable to retrieve %s source for tool %q", srcName, name)
 			}
 		}
-		m, err := tool.Manifest(src)
-		if err != nil {
-			return tools.ToolsetManifest{}, fmt.Errorf("error generating manifest for tool %q: %w", name, err)
+		var m tools.Manifest
+		if _, isLazy := src.(sources.LazySource); isLazy {
+			// Lazy loading: source not yet materialized; use the static manifest
+			// instead of forcing a connection.
+			m = tool.StaticManifest()
+		} else {
+			var err error
+			m, err = tool.Manifest(src)
+			if err != nil {
+				return tools.ToolsetManifest{}, fmt.Errorf("error generating manifest for tool %q: %w", name, err)
+			}
 		}
 		toolsManifest[name] = m
 	}

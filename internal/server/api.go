@@ -119,12 +119,19 @@ func toolGetHandler(s *Server, w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	toolManifest, err := tool.Manifest(src)
-	if err != nil {
-		err = fmt.Errorf("error generating manifest for tool %q: %w", toolName, err)
-		s.logger.DebugContext(ctx, err.Error())
-		_ = render.Render(w, r, newErrResponse(err, http.StatusInternalServerError))
-		return
+	var toolManifest tools.Manifest
+	if _, isLazy := src.(sources.LazySource); isLazy {
+		// Lazy loading: source not yet materialized; serve the static manifest
+		// rather than forcing a connection.
+		toolManifest = tool.StaticManifest()
+	} else {
+		toolManifest, err = tool.Manifest(src)
+		if err != nil {
+			err = fmt.Errorf("error generating manifest for tool %q: %w", toolName, err)
+			s.logger.DebugContext(ctx, err.Error())
+			_ = render.Render(w, r, newErrResponse(err, http.StatusInternalServerError))
+			return
+		}
 	}
 	// TODO: this can be optimized later with some caching
 	m := tools.ToolsetManifest{
@@ -171,6 +178,15 @@ func toolInvokeHandler(s *Server, w http.ResponseWriter, r *http.Request) {
 			s.logger.DebugContext(ctx, err.Error())
 			_ = render.Render(w, r, newErrResponse(err, http.StatusNotFound))
 			return
+		}
+		// Lazy loading: unwrap the deferred source into a live one before use.
+		if lz, isLazy := src.(sources.LazySource); isLazy {
+			src, err = lz.Materialize(ctx)
+			if err != nil {
+				s.logger.DebugContext(ctx, err.Error())
+				_ = render.Render(w, r, newErrResponse(err, http.StatusNotFound))
+				return
+			}
 		}
 	}
 

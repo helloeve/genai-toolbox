@@ -65,6 +65,13 @@ type Server struct {
 	mcpPrmFile          string
 	httpMaxRequestBytes int64
 	enableDraftSpecs    bool
+	lazyLoading         bool
+}
+
+// IsLazyLoading reports whether the server was started with lazy source loading.
+// Used by the dynamic-reload path to keep deferring sources on reload.
+func (s *Server) IsLazyLoading() bool {
+	return s.lazyLoading
 }
 
 func InitializeConfigs(ctx context.Context, cfg ServerConfig) (
@@ -99,33 +106,70 @@ func InitializeConfigs(ctx context.Context, cfg ServerConfig) (
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("failed to get logger from context: %w", err)
 	}
 
-	// initialize and validate the sources from configs
 	sourcesMap := make(map[string]sources.Source)
-	for name, sc := range cfg.SourceConfigs {
-		s, err := func() (sources.Source, error) {
-			childCtx, span := instrumentation.Tracer.Start(
-				ctx,
-				"toolbox/server/source/init",
-				trace.WithAttributes(attribute.String("source_type", sc.SourceConfigType())),
-				trace.WithAttributes(attribute.String("source_name", name)),
-			)
-			defer span.End()
-			s, err := sc.Initialize(childCtx, instrumentation.Tracer)
+	if cfg.LazyLoading {
+		// Under lazy loading, sources are not initialized here. Instead a
+		// deferred lazySource wrapper (holding the env-unresolved config block)
+		// is stored for each source and materialized on the first tool call that
+		// needs it. Tools still initialize, so skip the source-dependent
+		// validation below.
+		cfg.SkipSourceValidation = true
+		tracer := instrumentation.Tracer
+		// materialize resolves env vars for a single source's raw config block,
+		// decodes it, and initializes (connects) the source. It runs on the first
+		// tool call that needs the source. It lives here (not in the sources
+		// package) because it depends on UnmarshalPrimitiveConfig, which knows all
+		// primitive types.
+		materialize := func(mctx context.Context, rawBlock []byte) (sources.Source, error) {
+			resolved, err := util.ResolveEnvVars(string(rawBlock))
 			if err != nil {
-				return nil, fmt.Errorf("unable to initialize source %q: %w", name, err)
+				return nil, err
 			}
-			return s, nil
-		}()
-		if err != nil {
-			return nil, nil, nil, nil, nil, nil, err
+			srcCfgs, _, _, _, _, _, err := UnmarshalPrimitiveConfig(mctx, []byte(resolved))
+			if err != nil {
+				return nil, fmt.Errorf("unable to decode source config: %w", err)
+			}
+			for _, sc := range srcCfgs {
+				return sc.Initialize(mctx, tracer)
+			}
+			return nil, fmt.Errorf("no source found in config block")
 		}
-		sourcesMap[name] = s
+		for name, block := range cfg.RawSourceBlocks {
+			sourcesMap[name] = sources.NewLazySource(name, block, materialize)
+		}
+		sourceNames := make([]string, 0, len(sourcesMap))
+		for name := range sourcesMap {
+			sourceNames = append(sourceNames, name)
+		}
+		l.InfoContext(ctx, fmt.Sprintf("Lazy loading enabled: %d source(s) deferred, initialized on first use: %s", len(sourcesMap), strings.Join(sourceNames, ", ")))
+	} else {
+		// initialize and validate the sources from configs
+		for name, sc := range cfg.SourceConfigs {
+			s, err := func() (sources.Source, error) {
+				childCtx, span := instrumentation.Tracer.Start(
+					ctx,
+					"toolbox/server/source/init",
+					trace.WithAttributes(attribute.String("source_type", sc.SourceConfigType())),
+					trace.WithAttributes(attribute.String("source_name", name)),
+				)
+				defer span.End()
+				s, err := sc.Initialize(childCtx, instrumentation.Tracer)
+				if err != nil {
+					return nil, fmt.Errorf("unable to initialize source %q: %w", name, err)
+				}
+				return s, nil
+			}()
+			if err != nil {
+				return nil, nil, nil, nil, nil, nil, err
+			}
+			sourcesMap[name] = s
+		}
+		sourceNames := make([]string, 0, len(sourcesMap))
+		for name := range sourcesMap {
+			sourceNames = append(sourceNames, name)
+		}
+		l.InfoContext(ctx, fmt.Sprintf("Initialized %d sources: %s", len(sourcesMap), strings.Join(sourceNames, ", ")))
 	}
-	sourceNames := make([]string, 0, len(sourcesMap))
-	for name := range sourcesMap {
-		sourceNames = append(sourceNames, name)
-	}
-	l.InfoContext(ctx, fmt.Sprintf("Initialized %d sources: %s", len(sourcesMap), strings.Join(sourceNames, ", ")))
 
 	// initialize and validate the auth services from configs
 	authServicesMap := make(map[string]auth.AuthService)
@@ -463,7 +507,13 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 
 	sseManager := newSseManager(ctx)
 
+	// Lazy sources are stored in the manager as lazySource wrappers (built in
+	// InitializeConfigs); no manager changes are needed.
 	primitiveManager := primitives.NewPrimitiveManager(sourcesMap, authServicesMap, embeddingModelsMap, toolsMap, promptsMap, groupsMap)
+
+	if cfg.LazyLoading {
+		l.WarnContext(ctx, "Lazy loading enabled: sources are initialized on first use. Startup success does not imply sources are reachable or their environment variables are set.")
+	}
 
 	limit := cfg.HttpMaxRequestBytes
 	if limit <= 0 {
@@ -487,6 +537,7 @@ func NewServer(ctx context.Context, cfg ServerConfig) (*Server, error) {
 		mcpPrmFile:          cfg.McpPrmFile,
 		httpMaxRequestBytes: limit,
 		enableDraftSpecs:    cfg.EnableDraftSpecs,
+		lazyLoading:         cfg.LazyLoading,
 	}
 
 	if s.enableDraftSpecs {

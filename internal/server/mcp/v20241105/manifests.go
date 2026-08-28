@@ -114,9 +114,17 @@ func GenerateListToolsResult(pMgr *primitives.PrimitiveManager, g group.Group, u
 				return ListToolsResult{}, fmt.Errorf("unable to retrieve %s source for tool %q", srcName, tool.GetName())
 			}
 		}
-		params, err := tool.GetParameters(src)
-		if err != nil {
-			return ListToolsResult{}, fmt.Errorf("error getting parameters for tool %q: %w", toolName, err)
+		var params parameters.Parameters
+		if _, isLazy := src.(sources.LazySource); isLazy {
+			// Lazy loading: source not yet materialized. Render the tool with its
+			// source-independent static parameters instead of forcing a connection.
+			params = tool.GetStaticParameters()
+		} else {
+			var err error
+			params, err = tool.GetParameters(src)
+			if err != nil {
+				return ListToolsResult{}, fmt.Errorf("error getting parameters for tool %q: %w", toolName, err)
+			}
 		}
 		toolManifest := generateToolManifest(toolName, tool.GetDescription(), tool.GetAuthRequired(), params, tool.GetAnnotations(), urlParams)
 		mcpManifest = append(mcpManifest, toolManifest)

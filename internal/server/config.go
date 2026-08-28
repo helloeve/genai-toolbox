@@ -103,6 +103,14 @@ type ServerConfig struct {
 	EnableDraftSpecs bool
 	// SkipSourceValidation skips source validation during server startup
 	SkipSourceValidation bool
+	// LazyLoading, when true, skips source initialization and source-scoped
+	// env-var resolution at startup. Sources are materialized on the first tool
+	// call that needs them (see RawSourceBlocks).
+	LazyLoading bool
+	// RawSourceBlocks holds the env-unresolved, flat-format YAML config for each
+	// source, keyed by source name. Populated only when LazyLoading is enabled;
+	// consumed lazily to materialize sources on first use.
+	RawSourceBlocks map[string][]byte
 	// DisableExt specifies MCP extension URIs disabled on this server.
 	DisableExt []string
 }

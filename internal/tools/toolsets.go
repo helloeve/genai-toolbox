@@ -72,9 +72,17 @@ func (t Toolset) BuildManifest(pMgr PrimitiveManagerI) (ToolsetManifest, error) 
 				return ToolsetManifest{}, fmt.Errorf("unable to retrieve %s source for tool %q", srcName, (*tool).GetName())
 			}
 		}
-		m, err := (*tool).Manifest(src)
-		if err != nil {
-			return ToolsetManifest{}, fmt.Errorf("error generating manifest for tool %q: %w", (*tool).GetName(), err)
+		var m Manifest
+		if _, isLazy := src.(sources.LazySource); isLazy {
+			// Lazy loading: source not yet materialized; use the static manifest
+			// instead of forcing a connection.
+			m = (*tool).StaticManifest()
+		} else {
+			var err error
+			m, err = (*tool).Manifest(src)
+			if err != nil {
+				return ToolsetManifest{}, fmt.Errorf("error generating manifest for tool %q: %w", (*tool).GetName(), err)
+			}
 		}
 		toolsManifest[(*tool).GetName()] = m
 	}

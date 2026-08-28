@@ -76,5 +76,6 @@ func ServeFlags(flags *pflag.FlagSet, opts *ToolboxOptions) {
 	flags.StringSliceVar(&opts.Cfg.AllowedHosts, "allowed-hosts", []string{"*"}, "Specifies a list of hosts permitted to access this server. Defaults to '*'.")
 	flags.Int64Var(&opts.Cfg.HttpMaxRequestBytes, "http-max-request-bytes", server.DefaultHTTPMaxRequestBytes, "Maximum MCP HTTP request body size in bytes.")
 	flags.BoolVar(&opts.Cfg.EnableDraftSpecs, "enable-draft-specs", false, "Opt-in and test upcoming draft MCP specifications.")
+	flags.BoolVar(&opts.Cfg.LazyLoading, "lazy-loading", false, "Skip source initialization and source env-var resolution at startup; materialize each source on the first tool call that needs it. Tools are always advertised even if their sources are unreachable.")
 	flags.StringSliceVar(&opts.Cfg.DisableExt, "disable-ext", []string{}, "Specifies MCP extension URIs disabled on this server.")
 }

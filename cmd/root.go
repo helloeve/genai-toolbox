@@ -139,13 +139,16 @@ func handleDynamicReload(ctx context.Context, toolsFile internal.Config, s *serv
 		panic(err)
 	}
 
-	sourcesMap, authServicesMap, embeddingModelsMap, toolsMap, promptsMap, groupsMap, err := validateReloadEdits(ctx, toolsFile)
+	lazy := s.IsLazyLoading()
+	sourcesMap, authServicesMap, embeddingModelsMap, toolsMap, promptsMap, groupsMap, err := validateReloadEdits(ctx, toolsFile, lazy)
 	if err != nil {
 		errMsg := fmt.Errorf("unable to validate reloaded edits: %w", err)
 		logger.WarnContext(ctx, errMsg.Error())
 		return err
 	}
 
+	// In lazy mode, InitializeConfigs rebuilds deferred lazySource wrappers from
+	// the reloaded config, so swapping the maps here is all that is needed.
 	s.PrimitiveMgr.SetPrimitives(sourcesMap, authServicesMap, embeddingModelsMap, toolsMap, promptsMap, groupsMap)
 
 	return nil
@@ -153,7 +156,7 @@ func handleDynamicReload(ctx context.Context, toolsFile internal.Config, s *serv
 
 // validateReloadEdits checks that the reloaded config configs can initialized without failing
 func validateReloadEdits(
-	ctx context.Context, toolsFile internal.Config,
+	ctx context.Context, toolsFile internal.Config, lazy bool,
 ) (map[string]sources.Source, map[string]auth.AuthService, map[string]embeddingmodels.EmbeddingModel, map[string]tools.Tool, map[string]prompts.Prompt, map[string]group.Group, error,
 ) {
 	logger, err := util.LoggerFromContext(ctx)
@@ -180,6 +183,8 @@ func validateReloadEdits(
 		PromptConfigs:         toolsFile.Prompts,
 		GroupConfigs:          toolsFile.Groups,
 		IgnoreUnknownTools:    util.IgnoreUnknownToolsFromContext(ctx),
+		LazyLoading:           lazy,
+		RawSourceBlocks:       toolsFile.RawSourceBlocks,
 	}
 
 	sourcesMap, authServicesMap, embeddingModelsMap, toolsMap, promptsMap, groupsMap, err := server.InitializeConfigs(ctx, reloadedConfig)
@@ -363,7 +368,7 @@ func watchChanges(ctx context.Context, watchDirs map[string]bool, watchedFiles m
 		case <-debounce.C:
 			debounce.Stop()
 			var allFiles []string
-			parser := internal.ConfigParser{}
+			parser := internal.ConfigParser{LazySources: s.IsLazyLoading()}
 			if watchingFolder {
 				logger.DebugContext(ctx, "Reloading config folder.")
 				allFiles, err = internal.GetPathsFromConfigFolder(ctx, folderToWatch)

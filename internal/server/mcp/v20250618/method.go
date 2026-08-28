@@ -185,6 +185,13 @@ func toolsCallHandler(ctx context.Context, id jsonrpc.RequestId, g group.Group, 
 			err = fmt.Errorf("unable to retrieve source for tool %s", toolName)
 			return jsonrpc.NewError(id, jsonrpc.INTERNAL_ERROR, err.Error(), nil), err
 		}
+		// Lazy loading: unwrap the deferred source into a live one before use.
+		if lz, isLazy := src.(sources.LazySource); isLazy {
+			src, err = lz.Materialize(ctx)
+			if err != nil {
+				return jsonrpc.NewError(id, jsonrpc.INTERNAL_ERROR, err.Error(), nil), err
+			}
+		}
 	}
 
 	err = tool.ValidateSource(src)
